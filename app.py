@@ -807,10 +807,7 @@ def create_display_table(df, sort_option):
     """建立畫面上使用的中文報表，不影響下載的原始數字資料。"""
     # 先用完整資料排序，排序完成後才挑出要顯示的欄位。
     # 這樣即使 market_value_twd 不顯示在表格中，也能用它做預設排序。
-    if sort_option == "照字母開頭":
-        sorted_df = df.sort_values("symbol", ascending=True)
-    else:
-        sorted_df = df.sort_values("market_value_twd", ascending=False)
+    sorted_df = sort_holdings_for_display(df, sort_option)
 
     display_df = sorted_df[DISPLAY_COLUMNS].copy()
 
@@ -832,15 +829,24 @@ def create_display_table(df, sort_option):
     return display_df.rename(columns=DISPLAY_COLUMN_NAMES)
 
 
+def sort_holdings_for_display(df, sort_option):
+    """依使用者選擇的排序方式排列持倉報表。"""
+    sort_rules = {
+        "照字母開頭": ("symbol", True),
+        "報酬率": ("return_rate", False),
+        "台幣損益": ("profit_twd", False),
+        "持倉比重": ("market_value_twd", False),
+    }
+    sort_column, ascending = sort_rules.get(sort_option, ("market_value_twd", False))
+    return df.sort_values(sort_column, ascending=ascending)
+
+
 def apply_category_edits(report, edited_display_table, sort_option):
     """把持倉報表中編輯後的「類別」欄位寫回原始 report。"""
     updated_report = report.copy()
 
     # data_editor 回傳的資料列順序，會跟畫面上排序後的報表一致。
-    if sort_option == "照字母開頭":
-        sorted_index = updated_report.sort_values("symbol", ascending=True).index.tolist()
-    else:
-        sorted_index = updated_report.sort_values("market_value_twd", ascending=False).index.tolist()
+    sorted_index = sort_holdings_for_display(updated_report, sort_option).index.tolist()
 
     for row_position, original_index in enumerate(sorted_index):
         selected_category = edited_display_table.iloc[row_position]["類別"]
@@ -1071,7 +1077,7 @@ def render_sidebar_controls():
     )
     sort_option = st.sidebar.radio(
         "持倉報表排序",
-        ["持倉比重", "照字母開頭"],
+        ["持倉比重", "報酬率", "台幣損益", "照字母開頭"],
     )
 
     st.sidebar.subheader("CSV 格式說明")
