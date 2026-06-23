@@ -5,6 +5,17 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
+# 設定 matplotlib 字體以支援中文（優先順序：Noto Sans CJK → Microsoft JhengHei → fallback）
+# 在 Streamlit Cloud 環境中，透過 packages.txt 安裝 fonts-noto-cjk 以獲得 Noto Sans CJK 字體
+plt.rcParams["font.sans-serif"] = [
+    "Noto Sans CJK TC",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK SC",
+    "Microsoft JhengHei",
+    "Arial Unicode MS",
+    "DejaVu Sans",
+]
+plt.rcParams["axes.unicode_minus"] = False
 
 BACKGROUND_COLOR = "#14232b"
 REQUIRED_COLUMNS = ["symbol", "market", "shares", "cost"]
@@ -571,8 +582,7 @@ def plot_market_bar_on_ax(ax, market_summary):
 
 def plot_dashboard(df, top_n):
     """建立左邊總覽、右邊台股/美股、底部市場比例的 dashboard。"""
-    plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei"]
-    plt.rcParams["axes.unicode_minus"] = False
+    # matplotlib 字體設定已在模組初始化時設定（全域配置）
     symbol_color_map = create_symbol_color_map(df)
 
     overview_summary = make_top_n_summary(
@@ -844,9 +854,7 @@ def create_category_display_table(category_allocation):
 
 def plot_category_allocation(category_allocation, category_top_n):
     """畫出 category 類別配置 donut chart。"""
-    plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei"]
-    plt.rcParams["axes.unicode_minus"] = False
-
+    # matplotlib 字體設定已在模組初始化時設定（全域配置）
     fig, ax = plt.subplots(figsize=(7, 5.6))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(BACKGROUND_COLOR)
