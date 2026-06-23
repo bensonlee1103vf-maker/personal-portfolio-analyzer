@@ -40,6 +40,39 @@ QQQ,US,美股ETF,3,500
 0050,TW,台股ETF,1000,180
 006208,TW,台股ETF,500,110
 """
+
+
+def create_sample_excel_bytes() -> tuple:
+    """建立範例 Excel 的 bytes，供側邊欄下載使用。"""
+    df = pd.read_csv(BytesIO(SAMPLE_CSV.encode("utf-8-sig")))
+    output = BytesIO()
+
+    # 嘗試多個 engine，避免缺少某個套件時直接 crash
+    engines = ["xlsxwriter", "openpyxl", None]
+    for engine in engines:
+        try:
+            if engine:
+                with pd.ExcelWriter(output, engine=engine) as writer:
+                    df.to_excel(writer, index=False, sheet_name="Sheet1")
+            else:
+                with pd.ExcelWriter(output) as writer:
+                    df.to_excel(writer, index=False, sheet_name="Sheet1")
+
+            return output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "sample_portfolio.xlsx"
+        except Exception:
+            output.seek(0)
+            output.truncate(0)
+            continue
+
+    # 若所有 engine 都失敗，回傳 CSV bytes 作為 fallback，並提醒使用者安裝套件
+    try:
+        st.warning(
+            "無法建立範例 Excel，已改以 CSV 格式提供下載。若要產生 Excel，請安裝 xlsxwriter 或 openpyxl 套件。"
+        )
+    except Exception:
+        pass
+
+    return SAMPLE_CSV.encode("utf-8-sig"), "text/csv", "sample_portfolio.csv"
 MARKET_NAME_MAP = {"US": "美股", "TW": "台股"}
 MARKET_CURRENCY_MAP = {"US": "USD", "TW": "TWD"}
 DISPLAY_COLUMNS = [
@@ -90,41 +123,147 @@ EXCEL_SHEET_NAMES = {
 
 
 def load_portfolio(uploaded_file):
-    """讀取使用者上傳的 CSV，並檢查必要欄位是否存在。"""
-    df = pd.read_csv(uploaded_file, dtype={"symbol": str, "market": str, "category": str})
+    """相容用的讀取函式，維持原有介面（內部已改為支援 Excel）。"""
+    return load_uploaded_file(uploaded_file)
 
+
+def load_uploaded_file(uploaded_file):
+    """讀取使用者上傳的 Excel（.xlsx/.xls）。
+
+    - 預設讀取第一個工作表；若檔案有多個工作表，會提示使用者選擇。
+    - 讀取後呼叫 `clean_uploaded_portfolio` 做進一步檢查與轉型。
+    """
+    # 檔名副檔名檢查
+    filename = getattr(uploaded_file, "name", "")
+    ext = filename.split(".")[-1].lower() if filename and "." in filename else ""
+    if ext not in {"xlsx", "xls"}:
+        st.error("只支援 Excel 檔 (.xlsx, .xls)。")
+        raise ValueError("只支援 Excel 檔 (.xlsx, .xls)。")
+
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception:
+        st.error("無法讀取上傳的 Excel 檔案。請確認檔案不是損毀或受保護的格式。")
+        raise ValueError("無法讀取上傳的 Excel 檔案。")
+
+    sheets = xls.sheet_names
+    if len(sheets) > 1:
+        sheet = st.selectbox("選擇要分析的工作表", sheets)
+    else:
+        sheet = sheets[0]
+
+    try:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+    except Exception:
+        st.error("讀取選定的工作表失敗，請確認該工作表為表格格式且第一列為欄位名稱。")
+        raise ValueError("讀取工作表失敗。")
+
+    df.columns = df.columns.str.strip()
+
+    try:
+        cleaned = clean_uploaded_portfolio(df)
+    except ValueError:
+        raise
+
+    return cleaned
+
+
+def clean_uploaded_portfolio(df: pd.DataFrame) -> pd.DataFrame:
+    """在讀取 Excel 後呼叫，統一清理欄位名稱與內容，並做欄位型別驗證。
+
+    會執行的清理項目：
+    - 欄位名稱 strip
+    - `symbol` 一律為字串並 strip
+    - 文字欄位 strip
+    - `market` 轉大寫並 strip
+    - 若缺少 `category` 欄位，補上並填入「未分類」
+    - shares / cost：允許含有千分號或貨幣符號（如 1,000、NT$1,000、$100），
+      會移除非數字字元後嘗試轉成 float。
+
+    若發現格式錯誤會以 ValueError 被丟出，上層會以 st.error 顯示友善訊息。
+    """
+
+    # 檢查必要欄位名稱是否存在（先不用轉型）
     missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_columns:
-        missing_text = ", ".join(missing_columns)
-        raise ValueError(f"CSV 缺少必要欄位：{missing_text}")
+        # 顯示通用的使用者友善訊息
+        msg = (
+            "Excel 缺少必要欄位。必要欄位為 symbol, market, shares, cost。category 可選填。"
+        )
+        st.error(msg)
+        raise ValueError(msg)
 
-    df = ensure_category_column(df)[PORTFOLIO_COLUMNS].copy()
+    result = df.copy()
 
-    # 把 market 統一成大寫，避免使用者輸入 us / tw 時判斷失敗。
-    df["market"] = df["market"].str.upper().str.strip()
-    df["symbol"] = df["symbol"].str.strip()
-    df["category"] = clean_category_series(df["category"])
+    # 文字欄位先做 strip
+    for col in result.columns:
+        if result[col].dtype == object or pd.api.types.is_string_dtype(result[col]):
+            result[col] = result[col].astype(str).str.strip()
 
-    # shares 和 cost 必須是數字，無法轉換的資料會變成 NaN，後面再檢查。
-    df["shares"] = pd.to_numeric(df["shares"], errors="coerce")
-    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+    # symbol 強制字串，保留前置 0
+    result["symbol"] = result["symbol"].astype(str).str.strip()
 
-    if df[["shares", "cost"]].isna().any().any():
-        raise ValueError("shares 和 cost 欄位必須是數字。")
+    # category 若不存在或為空就補成 未分類
+    if "category" not in result.columns:
+        result["category"] = "未分類"
+    result["category"] = clean_category_series(result["category"])
 
-    invalid_market = sorted(set(df["market"]) - {"US", "TW"})
+    # market 標準化成大寫
+    result["market"] = result["market"].astype(str).str.strip().str.upper()
+
+    # 檢查 market 是否只有 US / TW
+    invalid_market = sorted(set(result["market"].unique()) - {"US", "TW"})
     if invalid_market:
-        invalid_text = ", ".join(invalid_market)
-        raise ValueError(f"market 只支援 US 或 TW，目前有：{invalid_text}")
+        msg = "market 只能填 US 或 TW。"
+        st.error(msg)
+        raise ValueError(msg)
 
-    return df
+    # 解析 numeric 欄位的 helper
+    def parse_numeric_series(series: pd.Series, col_name: str) -> pd.Series:
+        original = series.astype(str).str.strip()
+
+        # 移除千分位逗號與貨幣符號，保留負號與小數點
+        cleaned = original.str.replace(r"[^0-9.\-]", "", regex=True)
+
+        # 轉成數字，失敗的會成為 NaN
+        numeric = pd.to_numeric(cleaned.replace("", pd.NA), errors="coerce")
+
+        # 找出空白(使用者未填)與轉換失敗的列，供友善訊息顯示
+        empty_rows = original[original.isin(["", "nan", "None"])].index.tolist()
+        failed_rows = numeric[numeric.isna() & ~original.isin(["", "nan", "None"])].index.tolist()
+
+        messages = []
+        if empty_rows:
+            messages.append(f"欄位 {col_name} 有 {len(empty_rows)} 筆空白值，請補上後再上傳。")
+        if failed_rows:
+            sample_vals = original.loc[failed_rows].unique()[:5]
+            messages.append(
+                f"欄位 {col_name} 有 {len(failed_rows)} 筆格式不正確（範例：{', '.join(map(str, sample_vals))}），請使用數字或像 1,000 / NT$1,000 / $100 的格式。"
+            )
+
+        if messages:
+            # 先在介面上顯示具體錯誤，再以通用錯誤停止流程
+            for m in messages:
+                st.error(m)
+            raise ValueError(
+                "Excel 格式有問題，請檢查欄位與數字格式，或下載範例 Excel 重新填寫。"
+            )
+
+        return numeric.astype(float)
+
+    # 轉換 shares 與 cost
+    result["shares"] = parse_numeric_series(result["shares"], "shares")
+    result["cost"] = parse_numeric_series(result["cost"], "cost")
+
+    # 只回傳需要的欄位順序
+    return result[PORTFOLIO_COLUMNS].copy()
 
 
 def ensure_category_column(df):
     """確保資料一定有 category 欄位，空白分類會補成「未分類」。"""
     result = df.copy()
 
-    # 如果使用者的 CSV 沒有 category 欄位，就直接新增一欄。
+    # 如果使用者的上傳檔案沒有 category 欄位，就直接新增一欄。
     if "category" not in result.columns:
         result["category"] = "未分類"
         return result
@@ -141,7 +280,7 @@ def clean_category_series(series):
 
 
 def get_category_options(df):
-    """建立下拉選單選項，保留 CSV 原本自訂的分類名稱。"""
+    """建立下拉選單選項，保留上傳檔案原本自訂的分類名稱。"""
     options = CATEGORY_OPTIONS.copy()
 
     for category in df["category"].dropna().astype(str).str.strip().unique():
@@ -152,7 +291,7 @@ def get_category_options(df):
 
 
 def update_category_options(df, custom_category):
-    """合併固定分類、CSV 自帶分類與使用者新增的自訂分類。"""
+    """合併固定分類、上傳檔案自帶分類與使用者新增的自訂分類。"""
     options = get_category_options(df)
     custom_category = custom_category.strip() if custom_category else ""
 
@@ -1050,16 +1189,16 @@ def render_page_intro():
     """顯示頁面標題、說明與使用步驟。"""
     st.title("個人投資組合分析器")
     st.write(
-        "這個工具可以上傳持倉 CSV，自動抓取股價，統一換算成台幣，"
+        "這個工具可以上傳持倉 Excel（.xlsx/.xls），自動抓取股價，統一換算成台幣，"
         "並產生持倉報表與投資組合圖表。"
     )
 
     st.subheader("使用步驟")
     st.markdown(
         """
-        1. Step 1：準備 CSV 檔
-        2. Step 2：上傳 CSV
-        3. Step 3：系統自動抓股價並換算台幣
+        1. Step 1：準備持倉 Excel 檔
+        2. Step 2：上傳 Excel
+        3. Step 3：系統自動讀取表格、抓取股價並換算台幣
         4. Step 4：查看報表與圖表
         5. Step 5：下載 Excel 報表或 PNG 圖片
         """
@@ -1080,26 +1219,22 @@ def render_sidebar_controls():
         ["持倉比重", "報酬率", "台幣損益", "照字母開頭"],
     )
 
-    st.sidebar.subheader("CSV 格式說明")
+    st.sidebar.subheader("請上傳 Excel 檔，第一列必須包含欄位名稱。")
     st.sidebar.markdown(
         """
-        必要欄位：
-
         - symbol：股票代號，例如 NVDA、TSLA、0050
         - market：市場，只能填 US 或 TW
-        - shares：股數
+        - shares：股數，可填小數
         - cost：平均成本
-
-        選填欄位：
-
-        - category：分類，例如 AI基礎建設、台股ETF、金融科技。若留空或沒有此欄，會自動填入未分類。
+        - category：分類，可留空，系統會自動填入未分類
         """
     )
+    sample_data, sample_mime, sample_name = create_sample_excel_bytes()
     render_download_button(
-        label="下載範例持倉 CSV",
-        data=SAMPLE_CSV.encode("utf-8-sig"),
-        file_name="sample_portfolio.csv",
-        mime="text/csv",
+        label="下載範例 Excel",
+        data=sample_data,
+        file_name=sample_name,
+        mime=sample_mime,
         container=st.sidebar,
     )
 
@@ -1172,10 +1307,10 @@ def main():
     render_page_intro()
     top_n, category_top_n, sort_option = render_sidebar_controls()
 
-    uploaded_file = st.file_uploader("上傳 portfolio.csv", type=["csv"])
+    uploaded_file = st.file_uploader("上傳持倉 Excel 檔", type=["xlsx", "xls"]) 
 
     if uploaded_file is None:
-        st.info("請先上傳 portfolio.csv，或下載範例 CSV 試用。")
+        st.info("請先上傳持倉 Excel 檔，或下載範例 Excel 試用。")
         return
 
     try:
