@@ -749,6 +749,19 @@ def make_top_n_summary(data, name_col, value_col, top_n):
     return summary
 
 
+def get_effective_top_n(data, top_n):
+    """如果資料筆數比滑桿小，就用實際資料筆數當作顯示數量。"""
+    return min(top_n, len(data)) if len(data) > 0 else 0
+
+
+def make_top_n_title(prefix, data, top_n):
+    """建立圖表標題，只有真的有合併資料時才顯示「+ 其他」。"""
+    effective_top_n = get_effective_top_n(data, top_n)
+    if len(data) > effective_top_n:
+        return f"{prefix}前 {effective_top_n} 大 + 其他"
+    return f"{prefix}前 {effective_top_n} 大"
+
+
 def create_symbol_color_map(df):
     """建立股票代號與顏色的對照表，讓不同圖中的同一支股票顏色一致。"""
     sorted_symbols = (
@@ -871,11 +884,12 @@ def plot_donut_on_ax(
 
 def plot_top_holdings_bar(df, top_n, value_col="weight"):
     """畫出前 top_n 大持股的橫向長條圖。"""
-    fig, ax = plt.subplots(figsize=(10, max(5, top_n * 0.28)))
+    effective_top_n = get_effective_top_n(df, top_n)
+    fig, ax = plt.subplots(figsize=(10, max(5, effective_top_n * 0.28)))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(BACKGROUND_COLOR)
 
-    top_df = df.sort_values(value_col, ascending=False).head(top_n).copy()
+    top_df = df.sort_values(value_col, ascending=False).head(effective_top_n).copy()
     if top_df.empty:
         ax.text(
             0.5,
@@ -1029,6 +1043,8 @@ def plot_dashboard(df, top_n):
     """建立左邊總覽、右邊台股/美股、底部市場比例的 dashboard。"""
     # matplotlib 字體設定已在模組初始化時設定（全域配置）
     symbol_color_map = create_symbol_color_map(df)
+    tw_df = df[df["market"] == "TW"]
+    us_df = df[df["market"] == "US"]
 
     overview_summary = make_top_n_summary(
         data=df,
@@ -1045,14 +1061,14 @@ def plot_dashboard(df, top_n):
     market_summary["market_name"] = market_summary["market"].map(MARKET_NAME_MAP)
 
     tw_summary = make_top_n_summary(
-        data=df[df["market"] == "TW"],
+        data=tw_df,
         name_col="symbol",
         value_col="market_value_twd",
         top_n=top_n,
     )
 
     us_summary = make_top_n_summary(
-        data=df[df["market"] == "US"],
+        data=us_df,
         name_col="symbol",
         value_col="market_value_twd",
         top_n=top_n,
@@ -1085,7 +1101,7 @@ def plot_dashboard(df, top_n):
         summary=overview_summary,
         name_col="symbol",
         value_col="market_value_twd",
-        title=f"投資組合前 {top_n} 大 + 其他",
+        title=make_top_n_title("投資組合", df, top_n),
         center_text="總覽",
         label_size=11,
         pct_size=10,
@@ -1100,7 +1116,7 @@ def plot_dashboard(df, top_n):
         summary=tw_summary,
         name_col="symbol",
         value_col="market_value_twd",
-        title=f"台股前 {top_n} 大 + 其他",
+        title=make_top_n_title("台股", tw_df, top_n),
         center_text="台股",
         label_size=10,
         pct_size=9,
@@ -1116,7 +1132,7 @@ def plot_dashboard(df, top_n):
         summary=us_summary,
         name_col="symbol",
         value_col="market_value_twd",
-        title=f"美股前 {top_n} 大 + 其他",
+        title=make_top_n_title("美股", us_df, top_n),
         center_text="美股",
         label_size=10,
         pct_size=9,
@@ -1488,7 +1504,7 @@ def plot_category_chart(category_allocation, category_top_n):
         summary=chart_df,
         name_col="category",
         value_col="market_value_twd",
-        title=f"類別配置前 {category_top_n} 大 + 其他",
+        title=make_top_n_title("類別配置", category_allocation, category_top_n),
         center_text="類別",
         label_size=10,
         pct_size=9,
@@ -1692,8 +1708,9 @@ def render_overview_tab(report, summary, usd_twd, top_n):
     )
 
     if len(report) > 0:
+        effective_top_n = get_effective_top_n(report, top_n)
         top_holdings_fig = plot_top_holdings_bar(report, top_n)
-        st.subheader(f"前 {top_n} 大持股橫向長條圖")
+        st.subheader(f"前 {effective_top_n} 大持股橫向長條圖")
         st.pyplot(top_holdings_fig, use_container_width=True)
         render_download_button(
             label="下載前大持股長條圖 PNG",
