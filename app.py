@@ -1,6 +1,10 @@
+from datetime import date
 from io import BytesIO
 
 import matplotlib.pyplot as plt
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -19,7 +23,33 @@ plt.rcParams["axes.unicode_minus"] = False
 
 BACKGROUND_COLOR = "#14232b"
 REQUIRED_COLUMNS = ["symbol", "market", "shares", "cost"]
+OPTIONAL_COLUMNS = ["price"]
 PORTFOLIO_COLUMNS = ["symbol", "market", "category", "shares", "cost"]
+COLUMN_ALIASES = {
+    "symbol": "symbol",
+    "股票代號": "symbol",
+    "代號": "symbol",
+    "ticker": "symbol",
+    "market": "market",
+    "市場": "market",
+    "shares": "shares",
+    "股數": "shares",
+    "數量": "shares",
+    "持有股數": "shares",
+    "cost": "cost",
+    "成本": "cost",
+    "平均成本": "cost",
+    "均價": "cost",
+    "買入均價": "cost",
+    "category": "category",
+    "類別": "category",
+    "分類": "category",
+    "price": "price",
+    "現價": "price",
+    "價格": "price",
+    "目前價格": "price",
+    "市價": "price",
+}
 CHART_FONT_SCALE = 1.5
 CATEGORY_OPTIONS = [
     "未分類",
@@ -84,6 +114,7 @@ def create_sample_excel_bytes() -> tuple:
         pass
 
     return SAMPLE_CSV.encode("utf-8-sig"), "text/csv", "sample_portfolio.csv"
+
 MARKET_NAME_MAP = {"US": "美股", "TW": "台股"}
 MARKET_CURRENCY_MAP = {"US": "USD", "TW": "TWD"}
 DISPLAY_COLUMNS = [
@@ -94,6 +125,7 @@ DISPLAY_COLUMNS = [
     "currency",
     "cost",
     "price",
+    "market_value_twd",
     "profit",
     "profit_twd",
     "return_rate",
@@ -108,22 +140,49 @@ DISPLAY_COLUMN_NAMES = {
     "currency": "原始幣別",
     "cost": "原始均價",
     "price": "原始現價",
+    "market_value_twd": "台幣現值",
     "profit": "原始損益",
     "profit_twd": "台幣損益",
     "return_rate": "報酬率",
     "weight": "持倉比例",
     "price_status": "價格狀態",
 }
-NUMERIC_DISPLAY_COLUMNS = [
-    "股數",
-    "原始均價",
-    "原始現價",
-    "原始損益",
-    "台幣損益",
-    "報酬率",
-    "持倉比例",
+EXCEL_HOLDINGS_COLUMNS = [
+    "symbol",
+    "market",
+    "category",
+    "shares",
+    "currency",
+    "cost",
+    "price",
+    "profit",
+    "cost_twd",
+    "price_twd",
+    "cost_value_twd",
+    "market_value_twd",
+    "profit_twd",
+    "return_rate",
+    "weight",
+    "price_status",
 ]
-CATEGORY_NUMERIC_COLUMNS = ["台幣市值", "持倉比例"]
+EXCEL_HOLDINGS_COLUMN_NAMES = {
+    "symbol": "代號",
+    "market": "市場",
+    "category": "類別",
+    "shares": "股數",
+    "currency": "原始幣別",
+    "cost": "原始均價",
+    "price": "原始現價",
+    "profit": "原始損益",
+    "cost_twd": "台幣均價",
+    "price_twd": "台幣現價",
+    "cost_value_twd": "台幣成本",
+    "market_value_twd": "台幣市值",
+    "profit_twd": "台幣損益",
+    "return_rate": "報酬率",
+    "weight": "持倉比例",
+    "price_status": "價格狀態",
+}
 EXCEL_SHEET_NAMES = {
     "summary": "Summary",
     "holdings": "Holdings",
@@ -133,15 +192,33 @@ EXCEL_SHEET_NAMES = {
 }
 
 
-def load_portfolio(uploaded_file):
+def load_portfolio(uploaded_file, debug_mode=False):
     """相容用的讀取函式，維持原有介面（內部已改為支援 Excel）。"""
-    return load_uploaded_file(uploaded_file)
+    return load_uploaded_file(uploaded_file, debug_mode=debug_mode)
 
 
-def load_uploaded_file(uploaded_file):
+def is_instruction_sheet(sheet_name: str) -> bool:
+    """判斷工作表名稱是否為說明／README 類型的頁籤。"""
+    if not isinstance(sheet_name, str):
+        return False
+
+    normalized = sheet_name.strip().lower()
+    instruction_keywords = [
+        "說明",
+        "readme",
+        "instruction",
+        "instructions",
+        "help",
+        "note",
+    ]
+    return any(keyword in normalized for keyword in instruction_keywords)
+
+
+def load_uploaded_file(uploaded_file, debug_mode=False):
     """讀取使用者上傳的 Excel（.xlsx/.xls）。
 
-    - 預設讀取第一個工作表；若檔案有多個工作表，會提示使用者選擇。
+    - 先讀取整張工作表為 header=None 的 raw_df。
+    - 自動偵測最像欄位名稱的列，並從該列下一列開始讀資料。
     - 讀取後呼叫 `clean_uploaded_portfolio` 做進一步檢查與轉型。
     """
     # 檔名副檔名檢查
@@ -149,50 +226,293 @@ def load_uploaded_file(uploaded_file):
     ext = filename.split(".")[-1].lower() if filename and "." in filename else ""
     if ext not in {"xlsx", "xls"}:
         st.error("只支援 Excel 檔 (.xlsx, .xls)。")
-        raise ValueError("只支援 Excel 檔 (.xlsx, .xls)。")
+        st.stop()
 
     try:
         xls = pd.ExcelFile(uploaded_file)
     except Exception:
         st.error("無法讀取上傳的 Excel 檔案。請確認檔案不是損毀或受保護的格式。")
-        raise ValueError("無法讀取上傳的 Excel 檔案。")
+        st.stop()
 
     sheets = xls.sheet_names
-    if len(sheets) > 1:
-        sheet = st.selectbox("選擇要分析的工作表", sheets)
-    else:
-        sheet = sheets[0]
+    candidate_sheets = [sheet for sheet in sheets if not is_instruction_sheet(sheet)]
+    sheet = candidate_sheets[0] if candidate_sheets else sheets[0]
 
     try:
-        df = pd.read_excel(xls, sheet_name=sheet, dtype=str)
+        raw_df = pd.read_excel(
+            xls,
+            sheet_name=sheet,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+        )
     except Exception:
-        st.error("讀取選定的工作表失敗，請確認該工作表為表格格式且第一列為欄位名稱。")
-        raise ValueError("讀取工作表失敗。")
+        st.error("讀取工作表失敗，請確認 Excel 內容為有效表格。")
+        st.stop()
 
+    header_index = detect_header_row(raw_df)
+    if header_index is None:
+        st.error(
+            "找不到欄位名稱列。請確認 Excel 中有股票代號、市場、股數、平均成本等欄位。"
+        )
+        st.stop()
+
+    raw_headers = raw_df.iloc[header_index].astype(str).str.strip()
+    df = raw_df.iloc[header_index + 1 :].copy()
+    df.columns = raw_headers
+    df = df.reset_index(drop=True)
+
+    df.columns = df.columns.astype(str).str.strip()
+    df = normalize_uploaded_columns(df)
+    if debug_mode:
+        show_header_debug_info(header_index, raw_headers.tolist(), df.columns.tolist())
+
+    inspection = inspect_portfolio_data(df)
+
+    if inspection["missing_columns"]:
+        st.error(
+            "必要欄位缺少：" + ", ".join(inspection["missing_columns"]) + "。"
+        )
+        st.stop()
+
+    cleaned = clean_uploaded_portfolio(df)
+    return cleaned, inspection
+
+
+def load_sample_portfolio():
+    """載入內建範例資料，供使用者試玩用。"""
+    df = pd.read_csv(BytesIO(SAMPLE_CSV.encode("utf-8-sig")), dtype=str)
     df.columns = df.columns.str.strip()
+    df = normalize_uploaded_columns(df)
+    inspection = inspect_portfolio_data(df)
+    cleaned = clean_uploaded_portfolio(df)
+    return cleaned, inspection
 
-    try:
-        cleaned = clean_uploaded_portfolio(df)
-    except ValueError:
-        raise
 
-    return cleaned
+def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """將中文欄位名對應成內部使用的英文欄位名。"""
+    df = df.copy()
+    normalized_columns = []
+    for col in df.columns:
+        key = str(col).strip().lower()
+        normalized_columns.append(COLUMN_ALIASES.get(key, str(col).strip()))
+    df.columns = normalized_columns
+
+    if df.columns.duplicated().any():
+        duplicated = df.columns[df.columns.duplicated()].unique().tolist()
+        st.warning(
+            "上傳的欄位名稱中有重複對應，系統將使用第一個出現的欄位，其他重複欄位會被忽略。"
+        )
+        for label in duplicated:
+            cols = [col for col in df.columns if col == label]
+            df[label] = df.loc[:, cols].iloc[:, 0]
+        df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+    return df
+
+
+def detect_header_row(raw_df: pd.DataFrame):
+    """自動偵測 Excel 中最像欄位名稱的列。"""
+    if raw_df.empty:
+        return None
+
+    required_fields = set(REQUIRED_COLUMNS)
+    normalized_aliases = {key.lower(): value for key, value in COLUMN_ALIASES.items()}
+
+    for row_index, row in raw_df.iterrows():
+        matched_fields = set()
+        for cell in row:
+            cell_value = str(cell).strip().lower()
+            if not cell_value or cell_value == "nan":
+                continue
+
+            canonical_name = normalized_aliases.get(cell_value)
+            if canonical_name in required_fields:
+                matched_fields.add(canonical_name)
+
+        if len(matched_fields) >= 3:
+            return row_index
+
+    return None
+
+
+def show_header_debug_info(header_index: int, raw_headers, normalized_headers):
+    """顯示 header row 偵測的除錯資訊。"""
+    st.info(
+        f"偵測到的欄位名稱列：第 {header_index + 1} 列"
+    )
+    st.write("原始欄位名稱：", list(raw_headers))
+    st.write("normalize 後的欄位名稱：", list(normalized_headers))
+
+
+def inspect_portfolio_data(df: pd.DataFrame) -> dict:
+    """檢查資料欄位與基本格式，回傳檢查結果供畫面顯示。"""
+    checks = {
+        "missing_columns": [],
+        "invalid_market": [],
+        "shares_errors": None,
+        "cost_errors": None,
+        "price_errors": None,
+        "has_unclassified": False,
+        "price_present": "price" in df.columns,
+    }
+
+    # 檢查是否存在必要欄位
+    checks["missing_columns"] = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+
+    # 檢查 market
+    if "market" in df.columns:
+        markets = df["market"].astype(str).str.strip().str.upper()
+        checks["invalid_market"] = sorted(set(markets.unique()) - {"US", "TW"})
+
+    def numeric_check(series: pd.Series) -> dict:
+        original = series.astype(str).fillna("").str.strip()
+        cleaned = original.str.replace(r"[^0-9.\-]", "", regex=True)
+        numeric = pd.to_numeric(cleaned.replace("", pd.NA), errors="coerce")
+        bad = numeric.isna() & ~original.isin(["", "nan", "None"])
+        empty = original.isin(["", "nan", "None"])
+        return {
+            "total": len(series),
+            "valid": int((~bad & ~empty).sum()),
+            "empty": int(empty.sum()),
+            "invalid": int(bad.sum()),
+            "samples": original[bad].unique().tolist()[:5],
+        }
+
+    if "shares" in df.columns:
+        checks["shares_errors"] = numeric_check(df["shares"])
+    if "cost" in df.columns:
+        checks["cost_errors"] = numeric_check(df["cost"])
+    if checks["price_present"]:
+        checks["price_errors"] = numeric_check(df["price"])
+
+    if "category" not in df.columns or clean_category_series(df["category"]).eq("未分類").any():
+        checks["has_unclassified"] = True
+
+    return checks
+
+
+def show_data_check_results(inspection: dict) -> bool:
+    """顯示資料檢查結果，並回傳是否通過基本檢查。"""
+    has_blocking_errors = any(
+        [
+            inspection["missing_columns"],
+            inspection["invalid_market"],
+            inspection["shares_errors"]
+            and (inspection["shares_errors"]["empty"] > 0 or inspection["shares_errors"]["invalid"] > 0),
+            inspection["cost_errors"]
+            and (inspection["cost_errors"]["empty"] > 0 or inspection["cost_errors"]["invalid"] > 0),
+        ]
+    )
+    has_price_warning = (
+        inspection["price_present"]
+        and inspection["price_errors"]
+        and inspection["price_errors"]["invalid"] > 0
+    )
+
+    # 資料完全正常時不顯示檢查區塊，讓主畫面更乾淨。
+    if not has_blocking_errors and not has_price_warning:
+        return True
+
+    st.subheader("資料檢查結果")
+
+    if inspection["missing_columns"]:
+        st.error(
+            "必要欄位缺少：" + ", ".join(inspection["missing_columns"]) + "。"
+        )
+
+    if inspection["invalid_market"]:
+        st.error(
+            "market 欄位只能是 US 或 TW，目前偵測到："
+            + ", ".join(inspection["invalid_market"]) + "。"
+        )
+
+    def render_numeric_check(name: str, result: dict, required: bool = True):
+        if result is None:
+            return
+        if result["empty"] > 0 or result["invalid"] > 0:
+            if required:
+                st.error(
+                    f"{name} 欄位: {result['empty']} 筆空白，{result['invalid']} 筆格式不正確。"
+                )
+            else:
+                st.warning(
+                    f"{name} 欄位：{result['invalid']} 筆格式不正確，會視為無效價格。"
+                )
+
+    render_numeric_check("shares", inspection["shares_errors"])
+    render_numeric_check("cost", inspection["cost_errors"])
+    if inspection["price_present"]:
+        render_numeric_check("price", inspection["price_errors"], required=False)
+        if inspection["price_errors"] and inspection["price_errors"]["invalid"] > 0:
+            st.info("price 欄位僅在勾選使用 Excel price 時有效，格式錯誤的資料將被忽略。")
+
+    return not has_blocking_errors
+
+
+def render_portfolio_health(report):
+    """顯示投資組合健康檢查提醒。"""
+    st.subheader("投資組合健康檢查")
+    st.write("以下提醒為中性資訊，僅供參考，不構成投資建議。")
+
+    total_value = report["market_value_twd"].sum()
+    if total_value == 0:
+        st.info("尚未有可計算的持倉市值。")
+        return
+
+    messages = []
+    largest_weight = report["weight"].max()
+    if largest_weight > 0.3:
+        symbol = report.loc[report["weight"].idxmax(), "symbol"]
+        messages.append(
+            f"單一持股 {symbol} 佔比 {format_percent(largest_weight)}，高於 30%。"
+        )
+    else:
+        messages.append(f"單一持股最大佔比為 {format_percent(largest_weight)}。")
+
+    category_weights = report.groupby("category")["market_value_twd"].sum() / total_value
+    top_category = category_weights.idxmax()
+    top_category_weight = category_weights.max()
+    if top_category_weight > 0.5:
+        messages.append(
+            f"分類 {top_category} 佔比 {format_percent(top_category_weight)}，高於 50%。"
+        )
+    else:
+        messages.append(
+            f"最大的分類 {top_category} 佔比為 {format_percent(top_category_weight)}。"
+        )
+
+    unclassified_ratio = category_weights.get("未分類", 0)
+    if unclassified_ratio > 0.1:
+        messages.append(
+            f"未分類持股佔比 {format_percent(unclassified_ratio)}，建議補上分類以提升分析準確度。"
+        )
+    else:
+        messages.append(
+            f"未分類持股佔比為 {format_percent(unclassified_ratio)}。"
+        )
+
+    market_weights = report.groupby("market")["market_value_twd"].sum() / total_value
+    us_ratio = market_weights.get("US", 0)
+    tw_ratio = market_weights.get("TW", 0)
+    if us_ratio > 0.8:
+        messages.append(f"美股佔比 {format_percent(us_ratio)}，超過 80%。")
+    elif tw_ratio > 0.8:
+        messages.append(f"台股佔比 {format_percent(tw_ratio)}，超過 80%。")
+    else:
+        messages.append(
+            f"美股佔比 {format_percent(us_ratio)}，台股佔比 {format_percent(tw_ratio)}。"
+        )
+
+    etf_weight = report[report["category"].astype(str).str.contains("ETF")]["market_value_twd"].sum() / total_value
+    messages.append(f"ETF 類別佔比為 {format_percent(etf_weight)}。")
+
+    for message in messages:
+        st.write(f"- {message}")
 
 
 def clean_uploaded_portfolio(df: pd.DataFrame) -> pd.DataFrame:
-    """在讀取 Excel 後呼叫，統一清理欄位名稱與內容，並做欄位型別驗證。
-
-    會執行的清理項目：
-    - 欄位名稱 strip
-    - `symbol` 一律為字串並 strip
-    - 文字欄位 strip
-    - `market` 轉大寫並 strip
-    - 若缺少 `category` 欄位，補上並填入「未分類」
-    - shares / cost：允許含有千分號或貨幣符號（如 1,000、NT$1,000、$100），
-      會移除非數字字元後嘗試轉成 float。
-
-    若發現格式錯誤會以 ValueError 被丟出，上層會以 st.error 顯示友善訊息。
-    """
+    """在讀取 Excel 後呼叫，統一清理欄位名稱與內容，並做欄位型別驗證。"""
 
     # 檢查必要欄位名稱是否存在（先不用轉型）
     missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
@@ -230,7 +550,7 @@ def clean_uploaded_portfolio(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(msg)
 
     # 解析 numeric 欄位的 helper
-    def parse_numeric_series(series: pd.Series, col_name: str) -> pd.Series:
+    def parse_numeric_series(series: pd.Series, col_name: str, required: bool = True) -> pd.Series:
         original = series.astype(str).str.strip()
 
         # 移除千分位逗號與貨幣符號，保留負號與小數點
@@ -244,21 +564,27 @@ def clean_uploaded_portfolio(df: pd.DataFrame) -> pd.DataFrame:
         failed_rows = numeric[numeric.isna() & ~original.isin(["", "nan", "None"])].index.tolist()
 
         messages = []
-        if empty_rows:
+        if empty_rows and required:
             messages.append(f"欄位 {col_name} 有 {len(empty_rows)} 筆空白值，請補上後再上傳。")
         if failed_rows:
             sample_vals = original.loc[failed_rows].unique()[:5]
-            messages.append(
-                f"欄位 {col_name} 有 {len(failed_rows)} 筆格式不正確（範例：{', '.join(map(str, sample_vals))}），請使用數字或像 1,000 / NT$1,000 / $100 的格式。"
-            )
+            if required:
+                messages.append(
+                    f"欄位 {col_name} 有 {len(failed_rows)} 筆格式不正確（範例：{', '.join(map(str, sample_vals))}），請使用數字或像 1,000 / NT$1,000 / $100 的格式。"
+                )
+            else:
+                st.warning(
+                    f"欄位 {col_name} 有 {len(failed_rows)} 筆格式不正確（範例：{', '.join(map(str, sample_vals))}），這些值將視為無效。"
+                )
 
         if messages:
             # 先在介面上顯示具體錯誤，再以通用錯誤停止流程
             for m in messages:
                 st.error(m)
-            raise ValueError(
-                "Excel 格式有問題，請檢查欄位與數字格式，或下載範例 Excel 重新填寫。"
-            )
+            if required:
+                raise ValueError(
+                    "Excel 格式有問題，請檢查欄位與數字格式，或下載範例 Excel 重新填寫。"
+                )
 
         return numeric.astype(float)
 
@@ -266,8 +592,13 @@ def clean_uploaded_portfolio(df: pd.DataFrame) -> pd.DataFrame:
     result["shares"] = parse_numeric_series(result["shares"], "shares")
     result["cost"] = parse_numeric_series(result["cost"], "cost")
 
-    # 只回傳需要的欄位順序
-    return result[PORTFOLIO_COLUMNS].copy()
+    if "price" in result.columns:
+        # 可接受 Excel 中的 price 欄位為手動現價或備用價格。
+        result["price"] = parse_numeric_series(result["price"], "price", required=False)
+
+    # 只回傳必要欄位與可選價格欄位，方便後續選用 Excel 價格。
+    optional = [col for col in OPTIONAL_COLUMNS if col in result.columns]
+    return result[PORTFOLIO_COLUMNS + optional].copy()
 
 
 def ensure_category_column(df):
@@ -348,16 +679,32 @@ def get_usd_twd_rate():
     return float(close_prices.iloc[-1])
 
 
-def calculate_portfolio(df, usd_twd):
+def calculate_portfolio(df, usd_twd, use_excel_price=False):
     """計算價格、台幣市值、損益、報酬率與權重。"""
     result = df.copy()
 
     result["currency"] = result["market"].map(MARKET_CURRENCY_MAP)
     result["yahoo_symbol"] = result.apply(to_yahoo_symbol, axis=1)
-    result["price"] = result["yahoo_symbol"].apply(get_latest_price)
-    result["price_status"] = result["price"].apply(
-        lambda price: "價格正常" if pd.notna(price) else "價格抓取失敗，暫用成本估算"
-    )
+    result["yahoo_price"] = result["yahoo_symbol"].apply(get_latest_price)
+
+    if "price" in result.columns:
+        result["price"] = pd.to_numeric(result["price"], errors="coerce")
+    else:
+        result["price"] = pd.Series([pd.NA] * len(result), index=result.index)
+
+    if use_excel_price:
+        original_price = result["price"].copy()
+        result["price"] = result["price"].fillna(result["yahoo_price"])
+        result["price_status"] = original_price.apply(
+            lambda value: "使用 Excel price" if pd.notna(value) else "價格正常"
+        )
+        result.loc[result["price"].isna(), "price_status"] = "價格抓取失敗，暫用成本估算"
+    else:
+        result["price"] = result["yahoo_price"]
+        result["price_status"] = result["price"].apply(
+            lambda price: "價格正常" if pd.notna(price) else "價格抓取失敗，暫用成本估算"
+        )
+
     result["price_for_calc"] = result["price"].fillna(result["cost"])
 
     # 美股價格與成本用 USD/TWD 換成台幣，台股本來就是台幣。
@@ -380,7 +727,9 @@ def calculate_portfolio(df, usd_twd):
 
 
 def make_top_n_summary(data, name_col, value_col, top_n):
-    """取前 top_n 大項目，其餘合併成「其他」。"""
+    """取前 top_n 大項目，其餘合併成「其他」。
+    滑桿選幾大，就真的顯示幾大；剩下的合併成「其他」。
+    """
     if data.empty:
         return pd.DataFrame(columns=[name_col, value_col, "weight"])
 
@@ -456,19 +805,18 @@ def plot_donut_on_ax(
         ax.axis("off")
         return
 
-    # 使用同一份 color_map，確保同一支股票在不同 donut chart 中顏色一致。
     colors = None
     if color_map is not None:
         colors = [color_map.get(name, "#9aa4ad") for name in summary[name_col]]
 
     wedges, texts, autotexts = ax.pie(
         summary[value_col],
-        labels=summary[name_col],
+        labels=None,
         colors=colors,
         autopct="%1.1f%%",
         startangle=90,
-        pctdistance=0.80,
-        labeldistance=1.22,
+        pctdistance=0.78,
+        labeldistance=1.05,
         radius=radius,
         wedgeprops={
             "width": 0.38,
@@ -484,6 +832,21 @@ def plot_donut_on_ax(
     for autotext in autotexts:
         autotext.set_color("white")
         autotext.set_fontsize(pct_size)
+
+    legend_title = "代號" if name_col == "symbol" else "類別"
+    legend = ax.legend(
+        wedges,
+        summary[name_col],
+        title=legend_title,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=9,
+        frameon=False,
+    )
+    if legend:
+        legend.get_title().set_color("white")
+        for text in legend.get_texts():
+            text.set_color("white")
 
     ax.text(
         0,
@@ -504,6 +867,88 @@ def plot_donut_on_ax(
         y=title_y,
     )
     ax.axis("equal")
+
+
+def plot_top_holdings_bar(df, top_n, value_col="weight"):
+    """畫出前 top_n 大持股的橫向長條圖。"""
+    fig, ax = plt.subplots(figsize=(10, max(5, top_n * 0.28)))
+    fig.patch.set_facecolor(BACKGROUND_COLOR)
+    ax.set_facecolor(BACKGROUND_COLOR)
+
+    top_df = df.sort_values(value_col, ascending=False).head(top_n).copy()
+    if top_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "無持股資料",
+            color="white",
+            ha="center",
+            va="center",
+            fontsize=13 * CHART_FONT_SCALE,
+            transform=ax.transAxes,
+        )
+        ax.axis("off")
+        return fig
+
+    is_profit_chart = value_col in {"profit", "profit_twd"}
+    if is_profit_chart:
+        bar_colors = [
+            "#00B050" if value > 0 else "#FF0000" if value < 0 else "#9aa4ad"
+            for value in top_df[value_col]
+        ]
+    else:
+        bar_colors = ["#4cc9f0" if m == "TW" else "#ff595e" for m in top_df["market"]]
+
+    ax.barh(
+        y=top_df["symbol"],
+        width=top_df[value_col],
+        color=bar_colors,
+        edgecolor="white",
+        height=0.6,
+    )
+    ax.invert_yaxis()
+
+    max_abs_value = top_df[value_col].abs().max()
+    label_offset = max_abs_value * 0.02 if is_profit_chart and max_abs_value > 0 else 0.005
+
+    for i, (_, row) in enumerate(top_df.iterrows()):
+        value = row[value_col]
+        text_x = value + label_offset if not is_profit_chart or value >= 0 else value - label_offset
+        text_align = "left" if not is_profit_chart or value >= 0 else "right"
+        ax.text(
+            text_x,
+            i,
+            format_percent(value) if value_col == "weight" else format_twd(value),
+            va="center",
+            ha=text_align,
+            color="white",
+            fontsize=10,
+        )
+
+    ax.set_title(
+        f"Top {len(top_df)} 持股比例",
+        fontsize=16 * CHART_FONT_SCALE,
+        color="white",
+        fontweight="bold",
+    )
+    ax.set_xlabel("持倉比例" if value_col == "weight" else "台幣市值", color="white")
+    ax.set_ylabel("股票代號", color="white")
+    ax.tick_params(axis="x", colors="white")
+    ax.tick_params(axis="y", colors="white")
+
+    if is_profit_chart:
+        ax.axvline(0, color="white", linewidth=1, alpha=0.6)
+        min_value = min(0, top_df[value_col].min() * 1.15)
+        max_value = max(0, top_df[value_col].max() * 1.15)
+        if min_value == max_value:
+            min_value, max_value = -1, 1
+        ax.set_xlim(min_value, max_value)
+    else:
+        ax.set_xlim(0, min(1.0, top_df[value_col].max() * 1.15))
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
+
+    return fig
 
 
 def plot_market_bar_on_ax(ax, market_summary):
@@ -710,6 +1155,27 @@ def create_summary_sheet(summary):
     )
 
 
+def create_excel_holdings_sheet(holdings_df):
+    """建立 Excel 用的完整中文持倉明細。"""
+    export_df = holdings_df.sort_values("weight", ascending=False).reset_index(drop=True).copy()
+    export_df["market"] = export_df["market"].map(MARKET_NAME_MAP)
+    export_df = export_df.drop(columns=["index", "level_0"], errors="ignore")
+    export_df = export_df[EXCEL_HOLDINGS_COLUMNS].copy()
+    return export_df.rename(columns=EXCEL_HOLDINGS_COLUMN_NAMES)
+
+
+def excel_column_letter(col_idx):
+    """把 0-based 欄位位置轉成 Excel 欄名，例如 0 -> A。"""
+    letters = ""
+    col_num = col_idx + 1
+
+    while col_num:
+        col_num, remainder = divmod(col_num - 1, 26)
+        letters = chr(65 + remainder) + letters
+
+    return letters
+
+
 def create_multi_sheet_excel(
     holdings_df,
     summary,
@@ -719,19 +1185,15 @@ def create_multi_sheet_excel(
 ):
     """建立包含多個工作表的 Excel 報表。"""
     output = BytesIO()
-    export_holdings = holdings_df.drop(columns=["price_for_calc"], errors="ignore")
     sheets = {
+        EXCEL_SHEET_NAMES["holdings"]: create_excel_holdings_sheet(holdings_df),
         EXCEL_SHEET_NAMES["summary"]: create_summary_sheet(summary),
-        EXCEL_SHEET_NAMES["holdings"]: export_holdings,
         EXCEL_SHEET_NAMES["market"]: market_allocation,
         EXCEL_SHEET_NAMES["category"]: category_allocation,
         EXCEL_SHEET_NAMES["risk"]: risk_flags,
     }
 
-    try:
-        writer = pd.ExcelWriter(output, engine="xlsxwriter")
-    except ImportError:
-        writer = pd.ExcelWriter(output)
+    writer = pd.ExcelWriter(output, engine="openpyxl")
 
     with writer:
         write_excel_sheets(writer, sheets)
@@ -747,31 +1209,182 @@ def write_excel_sheets(writer, sheets):
 
 
 def apply_excel_formatting(writer, sheets):
-    """若使用 xlsxwriter，替 Excel 欄位加上簡單欄寬與百分比格式。"""
+    """在所有 sheets 寫入完成後，統一套用 Excel 格式。"""
     workbook = writer.book
 
-    # openpyxl 沒有 add_format；沒有格式能力時直接略過，Excel 仍可正常下載。
-    if not hasattr(workbook, "add_format"):
-        return
+    for sheet_name, sheet_df in sheets.items():
+        ws = workbook[sheet_name]
+        add_excel_table_and_filter(ws, sheet_name)
+        format_worksheet_header(ws)
+        apply_number_formats(ws)
+        apply_profit_loss_colors(ws)
+        highlight_price_status_rows(ws)
+        auto_adjust_column_widths(ws)
+        ws.freeze_panes = "A2"
 
-    money_format = workbook.add_format({"num_format": '#,##0.00'})
-    percent_format = workbook.add_format({"num_format": "0.00%"})
-    formatted_sheets = {
-        EXCEL_SHEET_NAMES["holdings"],
-        EXCEL_SHEET_NAMES["market"],
-        EXCEL_SHEET_NAMES["category"],
+
+def get_header_map(ws):
+    """回傳 {欄位名稱: 欄號}，方便依欄位名稱套格式。"""
+    return {
+        str(cell.value): cell.column
+        for cell in ws[1]
+        if cell.value is not None
     }
 
-    for sheet_name, sheet_df in sheets.items():
-        worksheet = writer.sheets[sheet_name]
-        worksheet.set_column(0, 20, 18)
 
-        if sheet_name in formatted_sheets:
-            worksheet.set_column(0, 20, 18, money_format)
+def apply_number_formats(ws):
+    """依欄位名稱套用 Excel number_format，保留真正數字型別。"""
+    headers = get_header_map(ws)
 
-        for idx, col_name in enumerate(sheet_df.columns):
-            if col_name in {"return_rate", "weight"}:
-                worksheet.set_column(idx, idx, 14, percent_format)
+    money_columns = {
+        "台幣均價",
+        "台幣現價",
+        "台幣成本",
+        "台幣市值",
+        "台幣損益",
+        "market_value_twd",
+        "cost_value_twd",
+        "profit_twd",
+    }
+    decimal_columns = {
+        "股數",
+        "原始均價",
+        "原始現價",
+        "原始損益",
+        "shares",
+        "cost",
+        "price",
+        "profit",
+    }
+    percent_columns = {
+        "報酬率",
+        "持倉比例",
+        "return_rate",
+        "weight",
+    }
+
+    for col_name, col_idx in headers.items():
+        number_format = None
+
+        if col_name in money_columns:
+            number_format = '"NT$"#,##0'
+        elif col_name in decimal_columns:
+            number_format = '#,##0.00'
+        elif col_name in percent_columns:
+            number_format = '0.00%'
+
+        if number_format:
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=col_idx).number_format = number_format
+
+    # Summary 是 metric/value 形式，需要依 metric 決定 value 格式。
+    if ws.title == EXCEL_SHEET_NAMES["summary"] and {"metric", "value"}.issubset(headers):
+        metric_col = headers["metric"]
+        value_col = headers["value"]
+        money_metrics = {"總市值", "總成本", "總損益"}
+        percent_metrics = {"總報酬率", "美股佔比", "台股佔比"}
+
+        for row in range(2, ws.max_row + 1):
+            metric = ws.cell(row=row, column=metric_col).value
+            value_cell = ws.cell(row=row, column=value_col)
+
+            if metric in money_metrics:
+                value_cell.number_format = '"NT$"#,##0'
+            elif metric in percent_metrics:
+                value_cell.number_format = '0.00%'
+
+
+def apply_profit_loss_colors(ws):
+    """正數顯示綠色，負數顯示紅色。"""
+    headers = get_header_map(ws)
+    green_font = Font(color="FF00B050")
+    red_font = Font(color="FFFF0000")
+
+    target_columns = ["原始損益", "台幣損益", "報酬率"]
+
+    for col_name in target_columns:
+        col_idx = headers.get(col_name)
+        if not col_idx:
+            continue
+
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            if isinstance(cell.value, (int, float)):
+                if cell.value > 0:
+                    cell.font = green_font
+                elif cell.value < 0:
+                    cell.font = red_font
+
+    if ws.title == EXCEL_SHEET_NAMES["summary"] and {"metric", "value"}.issubset(headers):
+        metric_col = headers["metric"]
+        value_col = headers["value"]
+        for row in range(2, ws.max_row + 1):
+            metric = ws.cell(row=row, column=metric_col).value
+            cell = ws.cell(row=row, column=value_col)
+            if metric in {"總損益", "總報酬率"} and isinstance(cell.value, (int, float)):
+                if cell.value > 0:
+                    cell.font = green_font
+                elif cell.value < 0:
+                    cell.font = red_font
+
+
+def auto_adjust_column_widths(ws):
+    """依內容長度調整欄寬，避免文字擠在一起。"""
+    for column_cells in ws.columns:
+        max_length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+
+        ws.column_dimensions[column_letter].width = min(max(max_length + 3, 12), 32)
+
+
+def format_worksheet_header(ws):
+    """套用第一列表頭樣式。"""
+    header_fill = PatternFill("solid", fgColor="14232B")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+
+def highlight_price_status_rows(ws):
+    """價格狀態不是價格正常時，整列用淡黃色標示。"""
+    headers = get_header_map(ws)
+    status_col = headers.get("價格狀態")
+    if not status_col:
+        return
+
+    warning_fill = PatternFill("solid", fgColor="FFF2CC")
+
+    for row in range(2, ws.max_row + 1):
+        status = ws.cell(row=row, column=status_col).value
+        if status and status != "價格正常":
+            for col in range(1, ws.max_column + 1):
+                ws.cell(row=row, column=col).fill = warning_fill
+
+
+def add_excel_table_and_filter(ws, sheet_name):
+    """替每個 sheet 建立 Excel Table 與篩選器。"""
+    if ws.max_row < 1 or ws.max_column < 1:
+        return
+
+    table_ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
+    table_name = "Table_" + "".join(ch if ch.isalnum() else "_" for ch in sheet_name)
+
+    table = Table(displayName=table_name, ref=table_ref)
+    style = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    table.tableStyleInfo = style
+    ws.add_table(table)
 
 
 def create_png_download(fig):
@@ -838,11 +1451,11 @@ def create_category_allocation(df):
 
 
 def create_category_display_table(category_allocation):
-    """把類別配置表轉成適合畫面閱讀的格式。"""
+    """把類別配置表轉成適合畫面閱讀的格式，保持數字型態。"""
     display_df = category_allocation.copy()
-    display_df.index = range(1, len(display_df) + 1)
-    display_df["market_value_twd"] = display_df["market_value_twd"].map(format_twd)
-    display_df["weight"] = display_df["weight"].map(format_percent)
+    display_df = display_df.reset_index(drop=True)
+    
+    # 保持數字型態，不轉換成字串
     return display_df.rename(
         columns={
             "category": "類別",
@@ -852,10 +1465,9 @@ def create_category_display_table(category_allocation):
     )
 
 
-def plot_category_allocation(category_allocation, category_top_n):
-    """畫出 category 類別配置 donut chart。"""
-    # matplotlib 字體設定已在模組初始化時設定（全域配置）
-    fig, ax = plt.subplots(figsize=(7, 5.6))
+def plot_category_chart(category_allocation, category_top_n):
+    """畫出 category 類別配置 donut chart，使用 Top N + 其他。"""
+    fig, ax = plt.subplots(figsize=(9, 5.6))
     fig.patch.set_facecolor(BACKGROUND_COLOR)
     ax.set_facecolor(BACKGROUND_COLOR)
 
@@ -888,6 +1500,10 @@ def plot_category_allocation(category_allocation, category_top_n):
 
     fig.tight_layout()
     return fig
+
+
+def plot_category_allocation(category_allocation, category_top_n):
+    return plot_category_chart(category_allocation, category_top_n)
 
 
 def create_risk_flags(df):
@@ -951,29 +1567,51 @@ def create_summary_metrics(df):
 
 
 def create_display_table(df, sort_option):
-    """建立畫面上使用的中文報表，不影響下載的原始數字資料。"""
+    """建立畫面上使用的中文報表，保持數字型態便於排序。
+    
+    數字欄位保持 float/numeric 種點，不轉換成字串。
+    顯示格式化戲碼由 st.dataframe 的 column_config 來處理。
+    """
     # 先用完整資料排序，排序完成後才挑出要顯示的欄位。
-    # 這樣即使 market_value_twd 不顯示在表格中，也能用它做預設排序。
     sorted_df = sort_holdings_for_display(df, sort_option)
 
     display_df = sorted_df[DISPLAY_COLUMNS].copy()
 
-    display_df.index = range(1, len(display_df) + 1)
+    # 使用 reset_index 移除原始 index，st.dataframe 用 hide_index 隱藏
+    display_df = display_df.reset_index(drop=True)
 
-    # 市場代碼轉成中文，讓第一次使用的人更容易讀懂。
+    # 市場代碼轉成中文，但保持其他數字欄位型態
     display_df["market"] = display_df["market"].map(MARKET_NAME_MAP)
 
-    display_df["price"] = display_df["price"].map(
-        lambda value: "抓取失敗" if pd.isna(value) else format_decimal(value)
-    )
-    display_df["shares"] = display_df["shares"].map(format_decimal)
-    display_df["cost"] = display_df["cost"].map(format_decimal)
-    display_df["profit"] = display_df["profit"].map(format_decimal)
-    display_df["profit_twd"] = display_df["profit_twd"].map(format_twd)
-    display_df["return_rate"] = display_df["return_rate"].map(format_percent)
-    display_df["weight"] = display_df["weight"].map(format_percent)
+    # 重命名欄位為中文，保持數字型態
+    display_df = display_df.rename(columns=DISPLAY_COLUMN_NAMES)
 
-    return display_df.rename(columns=DISPLAY_COLUMN_NAMES)
+    return display_df
+
+
+def get_profit_loss_text_color(value):
+    """依照正負數回傳表格文字顏色：正數綠色、負數紅色。"""
+    if pd.isna(value):
+        return ""
+    if value > 0:
+        return "color: #00B050; font-weight: 700;"
+    if value < 0:
+        return "color: #FF6B6B; font-weight: 700;"
+    return ""
+
+
+def style_holdings_table(display_table):
+    """替完整持倉報表加上損益紅綠色，不改變原本數字資料。"""
+    color_columns = [
+        col
+        for col in ["原始損益", "台幣損益", "報酬率"]
+        if col in display_table.columns
+    ]
+    if not color_columns:
+        return display_table
+
+    # pandas 新版使用 Styler.map，避免舊的 applymap 相容性問題。
+    return display_table.style.map(get_profit_loss_text_color, subset=color_columns)
 
 
 def sort_holdings_for_display(df, sort_option):
@@ -1000,74 +1638,6 @@ def apply_category_edits(report, edited_display_table, sort_option):
         updated_report.at[original_index, "category"] = selected_category
 
     return updated_report
-
-
-def style_holdings_table(display_table):
-    """替持倉報表加上損益與報酬率的條件色彩。"""
-
-    def parse_display_number(value):
-        """把 NT$1,234 或 12.34% 這類顯示文字轉回數字，方便判斷正負。"""
-        if pd.isna(value):
-            return 0
-
-        text = str(value)
-        text = text.replace("NT$", "").replace(",", "").replace("%", "").strip()
-
-        if text in {"", "N/A", "抓取失敗"}:
-            return 0
-
-        try:
-            return float(text)
-        except ValueError:
-            return 0
-
-    def profit_color(value):
-        number = parse_display_number(value)
-
-        if number > 0:
-            return "color: #4ade80; font-weight: 700;"
-        if number < 0:
-            return "color: #f87171; font-weight: 700;"
-        return ""
-
-    numeric_columns = [col for col in NUMERIC_DISPLAY_COLUMNS if col in display_table.columns]
-
-    return (
-        display_table.style
-        .map(profit_color, subset=["台幣損益", "報酬率"])
-        .set_properties(subset=numeric_columns, **{"text-align": "right"})
-        .set_table_styles(
-            [
-                {"selector": "th", "props": [("text-align", "left")]},
-            ]
-        )
-    )
-
-
-def style_category_table(display_table):
-    """讓類別配置表中的數字欄位靠右對齊。"""
-    numeric_columns = [col for col in CATEGORY_NUMERIC_COLUMNS if col in display_table.columns]
-    return (
-        display_table.style
-        .set_properties(subset=numeric_columns, **{"text-align": "right"})
-        .set_table_styles(
-            [
-                {"selector": "th", "props": [("text-align", "left")]},
-            ]
-        )
-    )
-
-
-def render_styled_html_table(styler, width_percent=100):
-    """用 HTML 顯示 styled table，確保數字靠右與條件色彩都會生效。"""
-    st.markdown(
-        f"""
-        <div class="styled-table-scroll" style="width: {width_percent}%;">
-            {styler.to_html()}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 def render_summary_metrics(summary):
@@ -1107,6 +1677,7 @@ def render_overview_tab(report, summary, usd_twd, top_n):
     """總覽 tab：摘要卡片、提醒與 Dashboard 圖。"""
     st.subheader("投資組合摘要")
     render_summary_metrics(summary)
+    render_portfolio_health(report)
     render_risk_messages(report)
     st.caption(f"USD/TWD 匯率：{usd_twd:.4f}")
 
@@ -1119,6 +1690,18 @@ def render_overview_tab(report, summary, usd_twd, top_n):
         file_name="portfolio_dashboard.png",
         mime="image/png",
     )
+
+    if len(report) > 10:
+        top_holdings_fig = plot_top_holdings_bar(report, top_n)
+        st.subheader(f"前 {top_n} 大持股橫向長條圖")
+        st.pyplot(top_holdings_fig, use_container_width=True)
+        render_download_button(
+            label="下載前大持股長條圖 PNG",
+            data=create_png_download(top_holdings_fig),
+            file_name="top_holdings_bar.png",
+            mime="image/png",
+        )
+        plt.close(top_holdings_fig)
 
     return fig
 
@@ -1138,18 +1721,30 @@ def render_holdings_tab(report, sort_option):
     locked_columns = [col for col in display_table.columns if col != "類別"]
 
     st.markdown("#### 完整持倉報表")
+    
+    # 定義 column_config 來格式化數字顯示，同時保持原始數字型態便於排序
+    column_config = {
+        "類別": st.column_config.SelectboxColumn(
+            "類別",
+            options=editable_category_options,
+            required=True,
+        ),
+        "股數": st.column_config.NumberColumn(format="%.2f"),
+        "原始均價": st.column_config.NumberColumn(format="%.2f"),
+        "原始現價": st.column_config.NumberColumn(format="%.2f"),
+        "原始損益": st.column_config.NumberColumn(format="%.0f"),
+        "台幣現值": st.column_config.NumberColumn(format="NT$%.0f"),
+        "台幣損益": st.column_config.NumberColumn(format="NT$%.0f"),
+        "報酬率": st.column_config.NumberColumn(format="percent"),
+        "持倉比例": st.column_config.NumberColumn(format="percent"),
+    }
+    
     edited_display_table = st.data_editor(
         style_holdings_table(display_table),
         use_container_width=True,
         disabled=locked_columns,
-        column_config={
-            "類別": st.column_config.SelectboxColumn(
-                "類別",
-                options=editable_category_options,
-                required=True,
-            )
-        },
-        hide_index=False,
+        column_config=column_config,
+        hide_index=True,
     )
     updated_report = apply_category_edits(report, edited_display_table, sort_option)
 
@@ -1165,9 +1760,20 @@ def render_category_tab(category_allocation, category_top_n):
     """類別 tab：類別配置表、donut chart 與簡短說明。"""
     st.subheader("類別配置")
     st.write("類別配置會依台幣市值由大到小排序，圖表會顯示前幾大，其餘合併成「其他」。")
-    render_styled_html_table(
-        style_category_table(create_category_display_table(category_allocation)),
-        width_percent=75,
+    
+    category_table = create_category_display_table(category_allocation)
+    
+    # 使用 column_config 來格式化顯示，保持底層數字型態
+    column_config = {
+        "台幣市值": st.column_config.NumberColumn(format="NT$%.0f"),
+        "持倉比例": st.column_config.NumberColumn(format="percent"),
+    }
+    
+    st.dataframe(
+        category_table,
+        column_config=column_config,
+        use_container_width=True,
+        hide_index=True,
     )
 
     category_fig = plot_category_allocation(category_allocation, category_top_n)
@@ -1186,9 +1792,9 @@ def render_excel_report_download(report, summary, market_allocation, category_al
         risk_flags,
     )
     render_download_button(
-        label="下載 Excel 報表",
+        label="下載完整 Excel 報表",
         data=excel_bytes,
-        file_name="portfolio_report_twd.xlsx",
+        file_name=f"portfolio_report_{date.today().strftime('%Y%m%d')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -1215,19 +1821,26 @@ def render_page_intro():
 
 def render_sidebar_controls():
     """顯示側邊欄設定，並回傳使用者選擇的控制值。"""
-    top_n = st.sidebar.slider("圖表顯示前幾大", min_value=1, max_value=15, value=7)
+    top_n = st.sidebar.slider("圖表顯示前幾大", min_value=1, max_value=20, value=7)
     category_top_n = st.sidebar.slider(
         "類別配置顯示前幾大",
         min_value=1,
-        max_value=15,
+        max_value=20,
         value=7,
     )
     sort_option = st.sidebar.radio(
         "持倉報表排序",
         ["持倉比重", "報酬率", "台幣損益", "照字母開頭"],
     )
+    use_excel_price = st.sidebar.checkbox(
+        "若 Excel 有 price 欄位，優先使用該欄位作為現價",
+        value=False,
+    )
+    debug_mode = st.sidebar.checkbox("顯示除錯資訊", value=False)
 
-    st.sidebar.subheader("請上傳 Excel 檔，第一列必須包含欄位名稱。")
+    st.sidebar.subheader(
+        "Excel 可以有標題列或空白列，系統會自動偵測欄位名稱列。"
+    )
     st.sidebar.markdown(
         """
         - symbol：股票代號，例如 NVDA、TSLA、0050
@@ -1235,6 +1848,7 @@ def render_sidebar_controls():
         - shares：股數，可填小數
         - cost：平均成本
         - category：分類，可留空，系統會自動填入未分類
+        - price：可選欄位，若有可當作現價使用
         """
     )
     sample_data, sample_mime, sample_name = create_sample_excel_bytes()
@@ -1246,7 +1860,7 @@ def render_sidebar_controls():
         container=st.sidebar,
     )
 
-    return top_n, category_top_n, sort_option
+    return top_n, category_top_n, sort_option, use_excel_price, debug_mode
 
 
 def main():
@@ -1263,14 +1877,32 @@ def main():
             background-color: {BACKGROUND_COLOR};
             color: white;
         }}
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6 {{
+            color: white;
+        }}
+        .stApp p, .stApp div, .stApp label, .stApp span {{
+            color: white;
+        }}
         [data-testid="stSidebar"] {{
             background-color: #0f1b22;
+        }}
+        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 {{
+            color: white;
+        }}
+        [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] div {{
+            color: #d0d0d0;
         }}
         div[data-testid="stMetric"] {{
             background-color: rgba(255, 255, 255, 0.03);
             border: 1px solid rgba(255, 255, 255, 0.08);
             border-radius: 8px;
             padding: 12px;
+        }}
+        div[data-testid="stMetric"] label {{
+            color: #b0b0b0;
+        }}
+        div[data-testid="stMetric"] > div {{
+            color: white;
         }}
         @media (max-width: 768px) {{
             .block-container {{
@@ -1284,28 +1916,11 @@ def main():
                 width: 100%;
             }}
         }}
-        .styled-table-scroll {{
-            overflow-x: auto;
-            max-height: 680px;
-            border: 1px solid rgba(255, 255, 255, 0.16);
-            border-radius: 8px;
+        .stTabs [data-baseweb="tab-list"] button {{
+            color: #d0d0d0;
         }}
-        .styled-table-scroll table {{
-            border-collapse: collapse;
-            min-width: 100%;
+        .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {{
             color: white;
-            background-color: #0e1117;
-        }}
-        .styled-table-scroll th,
-        .styled-table-scroll td {{
-            padding: 10px 12px;
-            border: 1px solid rgba(255, 255, 255, 0.10);
-            white-space: nowrap;
-        }}
-        .styled-table-scroll th {{
-            color: #aeb6c2;
-            background-color: #171a22;
-            font-weight: 700;
         }}
         </style>
         """,
@@ -1313,20 +1928,28 @@ def main():
     )
 
     render_page_intro()
-    top_n, category_top_n, sort_option = render_sidebar_controls()
+    top_n, category_top_n, sort_option, use_excel_price, debug_mode = render_sidebar_controls()
 
-    uploaded_file = st.file_uploader("上傳持倉 Excel 檔", type=["xlsx", "xls"]) 
+    upload_col, sample_col = st.columns([3, 1])
+    uploaded_file = upload_col.file_uploader("上傳持倉 Excel 檔", type=["xlsx", "xls"])
+    use_sample = sample_col.checkbox("使用範例資料試玩")
 
-    if uploaded_file is None:
-        st.info("請先上傳持倉 Excel 檔，或下載範例 Excel 試用。")
+    if use_sample:
+        portfolio_df, inspection = load_sample_portfolio()
+        st.success("已載入範例資料，可直接開始分析。")
+    elif uploaded_file is not None:
+        portfolio_df, inspection = load_portfolio(uploaded_file, debug_mode=debug_mode)
+    else:
+        st.info("請先上傳持倉 Excel 檔，或勾選「使用範例資料試玩」。")
+        return
+
+    if not show_data_check_results(inspection):
         return
 
     try:
-        portfolio_df = load_portfolio(uploaded_file)
-
         with st.spinner("正在抓最新股價與 USD/TWD 匯率..."):
             usd_twd = get_usd_twd_rate()
-            report = calculate_portfolio(portfolio_df, usd_twd)
+            report = calculate_portfolio(portfolio_df, usd_twd, use_excel_price=use_excel_price)
 
         summary = create_summary_metrics(report)
         overview_tab, holdings_tab, category_tab = st.tabs(["總覽", "持倉", "類別"])
