@@ -1691,7 +1691,7 @@ def render_overview_tab(report, summary, usd_twd, top_n):
         mime="image/png",
     )
 
-    if len(report) > 10:
+    if len(report) > 0:
         top_holdings_fig = plot_top_holdings_bar(report, top_n)
         st.subheader(f"前 {top_n} 大持股橫向長條圖")
         st.pyplot(top_holdings_fig, use_container_width=True)
